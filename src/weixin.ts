@@ -628,7 +628,6 @@ export default function (pi: ExtensionAPI) {
     if (!isConnected || !currentAccount) return;
     if (pendingMessages.length === 0) return;
 
-    // 提取本次 turn 的 assistant 文本
     const msg = event.message;
     if (msg.role !== "assistant") return;
     let replyText = "";
@@ -636,11 +635,15 @@ export default function (pi: ExtensionAPI) {
       if (c.type === "text") replyText += c.text;
     }
 
-    // 拿到队列中对应的待回复用户
+    // 报错兜底
+    const reason = msg.stopReason;
+    if ((reason === "error" || reason === "aborted") && !replyText.trim()) {
+      replyText = `[错误] ${msg.errorMessage || reason}`;
+    }
+
+    // 有文本就发送（包括报错信息）
     const pending = pendingMessages[0];
     const replyTo = replyToMap.get(pending.reqId);
-
-    // 有文本就发送
     if (replyText.trim() && replyTo) {
       try {
         await sendTextMessage(replyTo.userId, replyText.trim(), replyTo.contextToken);
@@ -649,9 +652,8 @@ export default function (pi: ExtensionAPI) {
       }
     }
 
-    // 最终轮 (stop/length) 才清理队列; toolUse 保留等下一轮
-    const reason = msg.stopReason;
-    if (reason === "stop" || reason === "length" || reason === "error" || reason === "aborted") {
+    // toolUse → 等下一轮; stop/length/error/aborted → 清理
+    if (reason !== "toolUse") {
       pendingMessages.shift();
       replyToMap.delete(pending.reqId);
       await updateStatus(ctx);
