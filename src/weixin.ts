@@ -407,8 +407,18 @@ export default function (pi: ExtensionAPI) {
   // ============================================================================
 
   async function performConnect(ctx?: any): Promise<boolean> {
+    // 当前没有加载账户, 尝试从缓存恢复
     if (!currentAccount?.token) {
-      if (ctx?.hasUI) await ctx.ui.notify("请先 /weixin-login 登录", "error");
+      const cfg = await loadConfig();
+      if (cfg.lastAccountId) {
+        const saved = getLoggedInAccounts().find(a => a.accountId === cfg.lastAccountId);
+        if (saved?.token) {
+          currentAccount = saved;
+        }
+      }
+    }
+    if (!currentAccount?.token) {
+      if (ctx?.hasUI) await ctx.ui.notify("未登录, 请先 /weixin-login 扫码", "error");
       return false;
     }
     if (isConnected) return true;
@@ -439,15 +449,12 @@ export default function (pi: ExtensionAPI) {
 
   async function performLogin(ctx?: any): Promise<boolean> {
     try {
-      // 先检查是否已有保存的账户（token）
+      // 先尝试从缓存恢复
       const config = await loadConfig();
-      const accounts = getLoggedInAccounts();
-
-      // 如果有已保存的账户，尝试直接加载（无需扫码）
       if (config.lastAccountId) {
-        const savedAccount = accounts.find(a => a.accountId === config.lastAccountId);
-        if (savedAccount?.token) {
-          currentAccount = savedAccount;
+        const saved = getLoggedInAccounts().find(a => a.accountId === config.lastAccountId);
+        if (saved?.token) {
+          currentAccount = saved;
           return await performConnect(ctx);
         }
       }
