@@ -1,0 +1,29 @@
+{
+  "name": "pi-weixin-bridge",
+  "version": "1.0.0",
+  "type": "module",
+  "description": "微信机器人 extension for pi (patched: QR display + package name fix)",
+  "keywords": [
+    "pi-package",
+    "pi",
+    "weixin",
+    "微信",
+    "wechat",
+    "extension"
+  ],
+  "license": "MIT",
+  "scripts": {
+    "test": "echo \"No tests\""
+  },
+  "pi": {
+    "extensions": [
+      "./src/weixin.ts"
+    ]
+  },
+  "peerDependencies": {
+    "@earendil-works/pi-coding-agent": "*"
+  },
+  "dependencies": {
+    "qrcode-terminal": "^0.12.0"
+  }
+}
