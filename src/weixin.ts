@@ -403,6 +403,37 @@ export default function (pi: ExtensionAPI) {
   }
 
   // ============================================================================
+  // 连接/断开 (被 login/logout/connect/disconnect 复用)
+  // ============================================================================
+
+  async function performConnect(ctx?: any): Promise<boolean> {
+    if (!currentAccount?.token) {
+      if (ctx?.hasUI) await ctx.ui.notify("请先 /weixin-login 登录", "error");
+      return false;
+    }
+    if (isConnected) return true;
+
+    const lockResult = await acquireLock(SESSION_ID, currentAccount.accountId);
+    if (!lockResult.success) {
+      if (ctx?.hasUI) await ctx.ui.notify(`[weixinbot] ${lockResult.message}`, "error");
+      await updateStatus(ctx);
+      return false;
+    }
+    isConnected = true;
+    startMonitor(pi);
+    if (ctx?.hasUI) await ctx.ui.notify("微信已连接", "info");
+    await updateStatus(ctx);
+    return true;
+  }
+
+  async function performDisconnect() {
+    if (!isConnected) return;
+    stopMonitor();
+    await releaseLock(SESSION_ID);
+    isConnected = false;
+  }
+
+  // ============================================================================
   // 登录/登出
   // ============================================================================
 
@@ -415,32 +446,9 @@ export default function (pi: ExtensionAPI) {
       // 如果有已保存的账户，尝试直接加载（无需扫码）
       if (config.lastAccountId) {
         const savedAccount = accounts.find(a => a.accountId === config.lastAccountId);
-
         if (savedAccount?.token) {
-
-          // 尝试获取排他锁
-          const lockResult = await acquireLock(SESSION_ID, savedAccount.accountId);
-          if (!lockResult.success) {
-            if (ctx?.hasUI) {
-              await ctx.ui.notify(`[weixinbot] ${lockResult.message}`, "error");
-            }
-            await updateStatus(ctx);
-            return false;
-          }
-
           currentAccount = savedAccount;
-          isConnected = true;
-
-          // 启动消息监控
-          startMonitor(pi);
-
-
-          if (ctx?.hasUI) {
-            await ctx.ui.notify(`[weixinbot] 微信已连接（从缓存加载）`, "info");
-          }
-
-          await updateStatus(ctx);
-          return true;
+          return await performConnect(ctx);
         }
       }
 
@@ -471,29 +479,12 @@ export default function (pi: ExtensionAPI) {
         // 加载保存的账户
         const accounts = getLoggedInAccounts();
         currentAccount = accounts.find(a => a.accountId === result.accountId) ?? null;
-
-        if (currentAccount) {
-          // 尝试获取排他锁
-          const lockResult = await acquireLock(SESSION_ID, result.accountId);
-          if (!lockResult.success) {
-            if (ctx?.hasUI) {
-              await ctx.ui.notify(`[weixinbot] ${lockResult.message}`, "error");
-            }
-            // 虽然登录成功，但不启动监控，因为锁被其他 session 持有
-            currentAccount = null;
-            await updateStatus(ctx);
-            return false;
-          }
-
-          await saveConfig({ lastAccountId: result.accountId });
-          isConnected = true;
-
-          // 启动消息监控
-          startMonitor(pi);
-
+        if (!currentAccount) {
           await updateStatus(ctx);
-          return true;
+          return false;
         }
+        await saveConfig({ lastAccountId: result.accountId });
+        return await performConnect(ctx);
       }
 
       await updateStatus(ctx);
@@ -507,12 +498,10 @@ export default function (pi: ExtensionAPI) {
   }
 
   async function performLogout(accountId: string, ctx?: any): Promise<void> {
+    await performDisconnect();
     logoutAccount(accountId);
     if (currentAccount?.accountId === accountId) {
-      stopMonitor();
-      await releaseLock(SESSION_ID);
       currentAccount = null;
-      isConnected = false;
     }
     await updateStatus(ctx);
   }
@@ -546,6 +535,24 @@ export default function (pi: ExtensionAPI) {
       if (ls.ownedByMe) { await releaseLock(SESSION_ID); await ctx.ui.notify("已释放锁", "info"); return }
       const ok = await forceReleaseLock()
       await ctx.ui.notify(ok ? "已强制释放锁" : "释放锁失败", ok ? "info" : "error")
+    },
+  });
+
+  pi.registerCommand("weixin-connect", {
+    description: "连接微信消息轮询（需已登录）",
+    handler: async (_args, ctx) => {
+      if (isConnected) { await ctx.ui.notify("已连接", "info"); return }
+      await performConnect(ctx);
+    },
+  });
+
+  pi.registerCommand("weixin-disconnect", {
+    description: "断开微信消息轮询（不登出）",
+    handler: async (_args, ctx) => {
+      if (!isConnected) { await ctx.ui.notify("未连接", "info"); return }
+      await performDisconnect();
+      await updateStatus(ctx);
+      await ctx.ui.notify("已断开", "info");
     },
   });
 
