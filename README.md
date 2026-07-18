@@ -1,6 +1,8 @@
-# pi-weixinbot-patched
+# pi-weixin-bridge
 
 微信机器人 extension for pi — 扫码登录后，微信私聊消息自动转发给 pi，pi 回复自动发回微信。
+
+Forked from [huang-x-h/pi-weixinbot](https://github.com/huang-x-h/pi-weixinbot) (MIT).
 
 ## 安装
 

@@ -25,5 +25,7 @@
   },
   "dependencies": {
     "qrcode-terminal": "^0.12.0"
-  }
+  },
+  "repository": "github.com/fyc09/pi-weixin-bridge",
+  "credit": "Forked from huang-x-h/pi-weixinbot (MIT) — original iLink protocol implementation"
 }
