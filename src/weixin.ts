@@ -621,67 +621,42 @@ export default function (pi: ExtensionAPI) {
   });
 
   // ============================================================================
-  // 流处理 - 捕获 AI 回复并发送回微信
+  // 流处理 - 每次 turn 结束发一条微信消息
   // ============================================================================
 
-  pi.on("message_end", async (event, ctx) => {
-    const message = event.message;
-    // 只处理助手消息（AI 回复）
-    if (message.role !== "assistant") {
-      return;
-    }
+  pi.on("turn_end", async (event, ctx) => {
+    if (!isConnected || !currentAccount) return;
+    if (pendingMessages.length === 0) return;
 
-    // 未登录时不处理消息
-    if (!isConnected || !currentAccount) {
-      return;
-    }
-
-    // 从队列中取出第一条消息（最早发送给 AI 的）
-    const pendingMsg = pendingMessages[0];
-    if (!pendingMsg) {
-      return;
-    }
-
-    // 获取对应的用户信息
-    const replyTo = replyToMap.get(pendingMsg.reqId);
-    if (!replyTo) {
-      pendingMessages.shift(); // 清理队列
-      replyToMap.delete(pendingMsg.reqId);
-      await updateStatus(ctx); // 更新状态栏
-      return;
-    }
-
-    // 提取文本内容
+    // 提取本次 turn 的 assistant 文本
+    const msg = event.message;
+    if (msg.role !== "assistant") return;
     let replyText = "";
-    for (const content of message.content) {
-      if (content.type === "text") {
-        replyText += content.text;
+    for (const c of msg.content) {
+      if (c.type === "text") replyText += c.text;
+    }
+
+    // 拿到队列中对应的待回复用户
+    const pending = pendingMessages[0];
+    const replyTo = replyToMap.get(pending.reqId);
+
+    // 有文本就发送
+    if (replyText.trim() && replyTo) {
+      try {
+        await sendTextMessage(replyTo.userId, replyText.trim(), replyTo.contextToken);
+      } catch (err: any) {
+        if (lastCtx?.hasUI) lastCtx.ui.notify("微信发送失败: " + err.message, "error");
       }
     }
 
-    if (!replyText.trim()) {
-      pendingMessages.shift(); // 清理队列
-      replyToMap.delete(pendingMsg.reqId);
-      await updateStatus(ctx); // 更新状态栏
-      return;
+    // 最终轮 (stop/length) 才清理队列; toolUse 保留等下一轮
+    const reason = msg.stopReason;
+    if (reason === "stop" || reason === "length" || reason === "error" || reason === "aborted") {
+      pendingMessages.shift();
+      replyToMap.delete(pending.reqId);
+      await updateStatus(ctx);
+      processMessageQueue();
     }
-
-    const { userId, contextToken } = replyTo;
-
-    try {
-      await sendTextMessage(userId, replyText.trim(), contextToken);
-    } catch (err: any) {
-    }
-
-    // 清理
-    pendingMessages.shift();
-    replyToMap.delete(pendingMsg.reqId);
-
-    // 更新状态栏显示待处理消息数
-    await updateStatus(ctx);
-
-    // 继续处理队列中的下一条消息
-    processMessageQueue();
   });
 
   // ============================================================================
