@@ -437,12 +437,13 @@ export default function (pi: ExtensionAPI) {
     cipher.setAutoPadding(false);
     const encrypted = Buffer.concat([cipher.update(padded), cipher.final()]);
     const filesize = encrypted.length; // 密文大小
+    const filekey = crypto.randomBytes(16).toString("hex");
 
     // 1) 获取上传 URL
     const uploadResp = await getUploadUrl({
       baseUrl: currentAccount.baseUrl ?? DEFAULT_BASE_URL,
       token: currentAccount.token,
-      filekey: crypto.randomBytes(16).toString("hex"),
+      filekey,
       media_type: uploadMediaType,
       to_user_id: to,
       rawsize,
@@ -628,23 +629,19 @@ export default function (pi: ExtensionAPI) {
     description: "发送文件/图片/视频给微信用户。根据文件类型自动选择发送方式(2=图片,4=文件,5=视频)。",
     parameters: Type.Object({
       path: Type.String({ description: "本地文件路径" }),
-      to: Type.Optional(Type.String({ description: "接收者用户 ID（可选）" })),
     }),
     async execute(_toolCallId, params, _signal, _onUpdate, _ctx) {
       if (!toolsEnabled) {
         return { content: [{ type: "text", text: "未连接微信, 请先 /weixin-connect" }], details: {}, isError: true };
       }
       try {
-        let toUserId = params.to;
-        if (!toUserId) {
-          const cm = pendingMessages.find(m => m.reqId === currentReqId);
-          if (cm) toUserId = cm.userId;
+        // 自动从待回复队列取接收者
+        const cm = pendingMessages.find(m => m.reqId === currentReqId);
+        if (!cm) {
+          return { content: [{ type: "text", text: "无法确定接收者，请先让微信用户发一条消息" }], details: {}, isError: true };
         }
-        if (!toUserId) {
-          return { content: [{ type: "text", text: "无法确定接收者" }], details: {}, isError: true };
-        }
-        const ct = pendingMessages.find(m => m.userId === toUserId);
-        const result = await sendFileMessage(params.path, toUserId, ct?.contextToken);
+        const ct = pendingMessages.find(m => m.userId === cm.userId);
+        const result = await sendFileMessage(params.path, cm.userId, ct?.contextToken);
         return { content: [{ type: "text", text: result }], details: {} };
       } catch (err: any) {
         return { content: [{ type: "text", text: `发送文件失败: ${err.message}` }], details: {}, isError: true };
