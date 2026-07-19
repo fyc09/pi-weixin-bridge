@@ -448,10 +448,11 @@ export default function (pi: ExtensionAPI) {
     const encrypted = Buffer.concat([cipher.update(padded), cipher.final()]);
 
     // 3) 上传到 CDN
-    const cdnUrl = (uploadResp.upload_full_url || uploadResp.upload_param || "").replace(
-      /^https?:\/\//i, "https://"
-    );
-    if (!cdnUrl) throw new Error("获取上传地址失败");
+    const CDN_BASE = "https://novac2c.cdn.weixin.qq.com/c2c";
+    const uploadParam = uploadResp.upload_param || "";
+    if (!uploadParam) throw new Error("获取上传参数失败");
+
+    const cdnUrl = `${CDN_BASE}/upload?encrypted_query_param=${encodeURIComponent(uploadParam)}&filekey=${encodeURIComponent(name)}`;
 
     const cdnResp = await fetch(cdnUrl, {
       method: "POST",
