@@ -270,6 +270,37 @@ export async function sendMessage(params: {
 }
 
 /**
+ * 发送原始消息（支持自定义 item_list）
+ */
+export async function sendRawMessage(params: {
+  baseUrl: string;
+  token?: string;
+  to: string;
+  clientId: string;
+  contextToken?: string;
+  itemList: any[];
+}): Promise<void> {
+  await postRequest({
+    baseUrl: params.baseUrl,
+    endpoint: "ilink/bot/sendmessage",
+    body: JSON.stringify({
+      msg: {
+        from_user_id: "",
+        to_user_id: params.to,
+        client_id: params.clientId,
+        message_type: 2,
+        message_state: 2,
+        item_list: params.itemList,
+        context_token: params.contextToken ?? undefined,
+      },
+      base_info: buildBaseInfo(),
+    }),
+    token: params.token,
+    timeoutMs: DEFAULT_API_TIMEOUT_MS,
+  });
+}
+
+/**
  * 获取上传 URL
  */
 export async function getUploadUrl(params: {

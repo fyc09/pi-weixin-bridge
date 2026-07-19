@@ -8,8 +8,10 @@
  */
 
 import { mkdir, readFile, writeFile } from "node:fs/promises";
-import { dirname, join } from "node:path";
+import { readFileSync, statSync, existsSync } from "node:fs";
+import { dirname, join, basename, extname } from "node:path";
 import { homedir } from "node:os";
+import crypto from "node:crypto";
 import qrcodeTerminal from "qrcode-terminal";
 
 import type { ExtensionAPI } from "@earendil-works/pi-coding-agent";
@@ -18,6 +20,8 @@ import { Type } from "@earendil-works/pi-ai";
 import {
   getUpdates,
   sendMessage as sendWeixinMessage,
+  sendRawMessage,
+  getUploadUrl,
   DEFAULT_BASE_URL,
 } from "./weixin-api.ts";
 import type { WeixinMessage, WeixinAccountData } from "./types.ts";
@@ -155,6 +159,7 @@ export default function (pi: ExtensionAPI) {
   let isConnected = false;
   let monitorAbortController: AbortController | null = null;
   let loginInProgress = false;
+  let toolsEnabled = false;
 
   const pendingMessages: PendingMessage[] = [];
   let isProcessing = false;
@@ -402,6 +407,83 @@ export default function (pi: ExtensionAPI) {
     });
   }
 
+  /**
+   * 发送文件/图片/视频
+   */
+  async function sendFileMessage(filePath: string, to: string, contextToken?: string): Promise<string> {
+    if (!currentAccount?.token) throw new Error("未登录微信，请先登录");
+    if (!existsSync(filePath)) throw new Error(`文件不存在: ${filePath}`);
+
+    const buf = readFileSync(filePath);
+    const rawsize = buf.length;
+    const rawfilemd5 = crypto.createHash("md5").update(buf).digest("hex");
+    const key = crypto.randomBytes(16).toString("hex");
+    const name = basename(filePath);
+    const ext = extname(filePath).toLowerCase();
+
+    // 自动检测文件类型: 2=图片, 4=文件, 5=视频（永不发语音 type=3）
+    const imageExts = [".jpg", ".jpeg", ".png", ".gif", ".webp", ".bmp", ".svg"];
+    const videoExts = [".mp4", ".mov", ".avi", ".mkv", ".webm", ".flv", ".wmv"];
+    const mediaType = imageExts.includes(ext) ? 2 : videoExts.includes(ext) ? 5 : 4;
+
+    // 1) 获取上传 URL
+    const uploadResp = await getUploadUrl({
+      baseUrl: currentAccount.baseUrl ?? DEFAULT_BASE_URL,
+      token: currentAccount.token,
+      filekey: name,
+      media_type: mediaType,
+      to_user_id: to,
+      rawsize,
+      rawfilemd5,
+      filesize: rawsize,
+      no_need_thumb: true,
+    });
+
+    // 2) AES-128-ECB 加密文件
+    const aeskey = Buffer.from(key, "hex");
+    const padLen = 16 - (buf.length % 16);
+    const padded = Buffer.concat([buf, Buffer.alloc(padLen, padLen)]);
+    const cipher = crypto.createCipheriv("aes-128-ecb", aeskey, null);
+    cipher.setAutoPadding(false);
+    const encrypted = Buffer.concat([cipher.update(padded), cipher.final()]);
+
+    // 3) 上传到 CDN
+    const cdnUrl = (uploadResp.upload_full_url || uploadResp.upload_param || "").replace(
+      /^https?:\/\//i, "https://"
+    );
+    if (!cdnUrl) throw new Error("获取上传地址失败");
+
+    const cdnResp = await fetch(cdnUrl, {
+      method: "POST",
+      headers: { "Content-Type": "application/octet-stream" },
+      body: encrypted,
+    });
+    if (!cdnResp.ok) throw new Error(`CDN 上传失败: ${cdnResp.status}`);
+
+    // 4) 发送消息
+    const downloadParam = cdnResp.headers.get("x-encrypted-param") || "";
+    await sendRawMessage({
+      baseUrl: currentAccount.baseUrl ?? DEFAULT_BASE_URL,
+      token: currentAccount.token,
+      to,
+      clientId: generateClientId(),
+      contextToken,
+      itemList: [{
+        type: mediaType,
+        file_item: {
+          file_name: name,
+          file_size: rawsize,
+          file_type: ext.replace(".", ""),
+          encrypt_type: 1,
+          encrypt_key: key,
+          encrypt_query_param: downloadParam,
+        },
+      }],
+    });
+
+    return `已发送 ${name} (${(rawsize / 1024).toFixed(1)} KB)`;
+  }
+
   // ============================================================================
   // 连接/断开 (被 login/logout/connect/disconnect 复用)
   // ============================================================================
@@ -431,6 +513,7 @@ export default function (pi: ExtensionAPI) {
     }
     isConnected = true;
     startMonitor(pi);
+    toolsEnabled = true;
     if (ctx?.hasUI) await ctx.ui.notify("微信已连接", "info");
     await updateStatus(ctx);
     return true;
@@ -441,6 +524,7 @@ export default function (pi: ExtensionAPI) {
     stopMonitor();
     await releaseLock(SESSION_ID);
     isConnected = false;
+    toolsEnabled = false;
   }
 
   // ============================================================================
@@ -512,6 +596,40 @@ export default function (pi: ExtensionAPI) {
     }
     await updateStatus(ctx);
   }
+
+  // ============================================================================
+  // 注册工具（始终注册，连接后启用）
+  // ============================================================================
+
+  pi.registerTool({
+    name: "weixin_send_file",
+    label: "Weixin Send File",
+    description: "发送文件/图片/视频给微信用户。根据文件类型自动选择发送方式(2=图片,4=文件,5=视频)。",
+    parameters: Type.Object({
+      path: Type.String({ description: "本地文件路径" }),
+      to: Type.Optional(Type.String({ description: "接收者用户 ID（可选）" })),
+    }),
+    async execute(_toolCallId, params, _signal, _onUpdate, _ctx) {
+      if (!toolsEnabled) {
+        return { content: [{ type: "text", text: "未连接微信, 请先 /weixin-connect" }], details: {}, isError: true };
+      }
+      try {
+        let toUserId = params.to;
+        if (!toUserId) {
+          const cm = pendingMessages.find(m => m.reqId === currentReqId);
+          if (cm) toUserId = cm.userId;
+        }
+        if (!toUserId) {
+          return { content: [{ type: "text", text: "无法确定接收者" }], details: {}, isError: true };
+        }
+        const ct = pendingMessages.find(m => m.userId === toUserId);
+        const result = await sendFileMessage(params.path, toUserId, ct?.contextToken);
+        return { content: [{ type: "text", text: result }], details: {} };
+      } catch (err: any) {
+        return { content: [{ type: "text", text: `发送文件失败: ${err.message}` }], details: {}, isError: true };
+      }
+    },
+  });
 
   // ============================================================================
   // 注册命令
