@@ -1,697 +1,37 @@
 /**
- * pi-weixinbot
- * 
- * 微信机器人 extension for pi
- * 支持扫码登录和消息收发
- * 
+ * pi-weixinbot - 微信机器人 extension for pi
+ *
+ * 支持扫码登录、消息收发、媒体下载/发送。
+ * 消息处理: 收到即发 (followUp 自动排队), turn_end 回复微信。
+ *
  * 参考: https://github.com/Tencent/openclaw-weixin
  */
-
-import { mkdir, readFile, writeFile } from "node:fs/promises";
-import { readFileSync, statSync, existsSync, mkdirSync, writeFileSync as fsWriteFileSync } from "node:fs";
-import { dirname, join, basename, extname } from "node:path";
-import { homedir } from "node:os";
-import { tmpdir } from "node:os";
-import crypto from "node:crypto";
-import qrcodeTerminal from "qrcode-terminal";
 
 import type { ExtensionAPI } from "@earendil-works/pi-coding-agent";
 import { Type } from "@earendil-works/pi-ai";
 
-import {
-  getUpdates,
-  sendMessage as sendWeixinMessage,
-  sendRawMessage,
-  getUploadUrl,
-  DEFAULT_BASE_URL,
-} from "./weixin-api.ts";
-import type { WeixinMessage, WeixinAccountData } from "./types.ts";
-import {
-  fullQRLogin,
-  getLoggedInAccounts,
-  logoutAccount,
-  getStateDir,
-} from "./weixin-auth.ts";
-import {
-  acquireLock,
-  releaseLock,
-  checkLockStatus,
-  forceReleaseLock,
-} from "./lock-manager.ts";
-
-// ============================================================================
-// 类型定义
-// ============================================================================
-
-interface Session {
-  frame: any;
-  streamId: string;
-  userId: string;
-  chatId: string;
-  timestamp: number;
-  accountId: string;
-  contextToken?: string;
-}
-
-interface PendingMessage {
-  reqId: string;
-  type: string;
-  text: string;
-  accountId: string;
-  userId: string;
-  contextToken?: string;
-}
-
-// ============================================================================
-// 工具函数
-// ============================================================================
-
-function generateClientId(): string {
-  const timestamp = Date.now().toString(36);
-  const random = Math.random().toString(36).substring(2, 10);
-  return `pi-weixin-${timestamp}-${random}`;
-}
-
-function getSessionId(): string {
-  if (process.env.PI_SESSION_ID) return process.env.PI_SESSION_ID;
-  if (process.env.PI_INSTANCE_ID) return process.env.PI_INSTANCE_ID;
-  const timestamp = Date.now().toString(36);
-  const random = Math.random().toString(36).substring(2, 6);
-  return `sess-${timestamp}-${random}`;
-}
-
-function getConfigPath(): string {
-  return join(getStateDir(), "config.json");
-}
-
-// ============================================================================
-// 消息处理
-// ============================================================================
-
-/**
- * 从消息中提取文本内容
- */
-function extractTextBody(itemList?: WeixinMessage["item_list"]): string {
-  if (!itemList?.length) return "";
-
-  for (const item of itemList) {
-    // 文本消息
-    if (item.type === 1 && item.text_item?.text != null) {
-      let text = String(item.text_item.text);
-
-      // 处理引用消息
-      const ref = item.ref_msg;
-      if (ref?.message_item) {
-        const refType = ref.message_item.type;
-        // 引用的是媒体消息，只取当前文本
-        if (refType === 2 || refType === 3 || refType === 4 || refType === 5) {
-          // 媒体类型
-        }
-        // 引用的是文本，添加引用前缀
-        else if (refType === 1 && ref.message_item.text_item?.text) {
-          text = `[引用: ${ref.message_item.text_item.text}]\n${text}`;
-        }
-      }
-
-      return text;
-    }
-
-    // 语音转文字
-    if (item.type === 3 && item.voice_item?.text) {
-      return item.voice_item.text;
-    }
-  }
-
-  return "";
-}
-
-/**
- * 过滤 Markdown 特殊字符（用于发送到微信）
- */
-function filterMarkdown(text: string): string {
-  // 移除可能干扰微信显示的 Markdown 格式
-  return text
-    .replace(/\*\*(.*?)\*\*/g, "$1")  // 粗体
-    .replace(/\*(.*?)\*/g, "$1")      // 斜体
-    .replace(/`(.*?)`/g, "$1")        // 行内代码
-    .replace(/```[\s\S]*?```/g, (match) => {
-      // 代码块，保留内容
-      return match.replace(/```\w*\n?/g, "").trim();
-    })
-    .replace(/\[(.*?)\]\(.*?\)/g, "$1")  // 链接
-    .replace(/^#+\s*/gm, "")          // 标题标记
-    .replace(/^[-*]\s+/gm, "• ")      // 列表标记
-    .replace(/^\d+\.\s+/gm, "");      // 有序列表
-}
-
-// ============================================================================
-// Extension
-// ============================================================================
+import { getSessionId } from "./utils.ts";
+import { createWeixinState } from "./state.ts";
+import { createMessaging } from "./messaging.ts";
+import { createMonitor } from "./monitor.ts";
+import { createConnection, checkLockStatus, forceReleaseLock, releaseLock } from "./connection.ts";
+import { getLoggedInAccounts } from "./weixin-auth.ts";
 
 export default function (pi: ExtensionAPI) {
-  // 保存 pi 实例供内部函数使用
-  const piInstance = pi;
-  // 初始化
-  const SESSION_ID = getSessionId();
-
-
-  // 全局状态
-  let currentAccount: (WeixinAccountData & { accountId: string }) | null = null;
-  let isConnected = false;
-  let monitorAbortController: AbortController | null = null;
-  let loginInProgress = false;
-  let toolsEnabled = false;
-
-  const pendingMessages: PendingMessage[] = [];
-  let isProcessing = false;
-  let currentReqId: string | null = null;
-  // 使用 Map 跟踪多个待回复的用户，避免被覆盖
-  const replyToMap = new Map<string, { userId: string; contextToken?: string }>();
-  let lastCtx: any = null;
+  // ── 初始化状态 + 模块 ──
+  const state = createWeixinState(pi, getSessionId());
+  const { sendTextMessage, sendFileMessage } = createMessaging(state);
+  const { startMonitor, stopMonitor } = createMonitor(state);
+  const {
+    performConnect,
+    performDisconnect,
+    performLogin,
+    performLogout,
+    updateStatus,
+  } = createConnection(state, { startMonitor, stopMonitor });
 
   // ============================================================================
-  // 状态栏更新
-  // ============================================================================
-
-  async function updateStatus(ctx: any) {
-    if (!ctx?.ui?.setStatus) return;
-
-    // 未登录且非登录中时，不显示状态栏
-    if (!currentAccount && !loginInProgress) {
-      ctx.ui.setStatus("weixinbot", "");
-      return;
-    }
-
-    let status = "[微信]";
-
-    if (loginInProgress) {
-      status += " ⏳ 登录中...";
-    } else if (isConnected && currentAccount) {
-      const accountShort = currentAccount.accountId.slice(0, 8);
-      const pending = pendingMessages.length;
-      status += ` ✅ 已连接 | ${accountShort}... | 待处理:${pending}`;
-    } else {
-      status += " ❌ 已断开";
-    }
-
-    // 添加锁状态
-    const lockStatus = await checkLockStatus();
-    if (lockStatus.locked) {
-      if (lockStatus.ownedByMe) {
-        status += " | 🔒";
-      } else {
-        status += " | ❌ 被占用";
-      }
-    }
-
-    ctx.ui.setStatus("weixinbot", status);
-  }
-
-  // ============================================================================
-  // 配置管理
-  // ============================================================================
-
-  async function loadConfig(): Promise<{ lastAccountId?: string }> {
-    try {
-      const data = await readFile(getConfigPath(), "utf8");
-      return JSON.parse(data);
-    } catch {
-      return {};
-    }
-  }
-
-  async function saveConfig(cfg: { lastAccountId?: string }) {
-    await mkdir(dirname(getConfigPath()), { recursive: true });
-    await writeFile(getConfigPath(), JSON.stringify(cfg, null, "\t") + "\n");
-  }
-
-  // ============================================================================
-  // 消息队列处理
-  // ============================================================================
-
-  async function processMessageQueue(ctx?: any) {
-    if (isProcessing || pendingMessages.length === 0) return;
-    isProcessing = true;
-
-    // 更新状态栏显示待处理消息数
-    if (ctx) await updateStatus(ctx);
-
-    const message = pendingMessages[0];
-    if (!message) {
-      isProcessing = false;
-      return;
-    }
-
-    // 检查账户是否匹配
-    if (message.accountId !== currentAccount?.accountId) {
-      pendingMessages.shift();
-      isProcessing = false;
-      processMessageQueue(ctx);
-      return;
-    }
-
-    currentReqId = message.reqId;
-    // 将用户信息存入 Map，而不是单个变量
-    replyToMap.set(message.reqId, { userId: message.userId, contextToken: message.contextToken });
-
-    try {
-      await pi.sendUserMessage([{ type: "text", text: message.text }], { deliverAs: "followUp" });
-    } catch (err: any) {
-
-      replyToMap.delete(message.reqId);
-      pendingMessages.shift(); // 发送失败，从队列移除
-      isProcessing = false;
-      processMessageQueue(ctx); // 继续处理下一条
-    }
-
-    // 注意：不要立即从队列移除，等 AI 回复完成后再移除
-    // pendingMessages.shift(); // 移到 message_end 处理中
-    isProcessing = false;
-    
-    // 继续处理队列中的下一条消息（如果有）
-    // 但如果上一条还在等待回复，这里可能会有问题
-    // 暂时只处理一条消息，等回复完成后再处理下一条
-    // processMessageQueue();
-  }
-
-  // ============================================================================
-  // 微信消息监控
-  // ============================================================================
-
-  async function startMonitor(piInstance?: ExtensionAPI) {
-    if (!currentAccount?.token || !currentAccount.accountId) {
-      return;
-    }
-
-    if (monitorAbortController) {
-      monitorAbortController.abort();
-    }
-
-    monitorAbortController = new AbortController();
-    const abortSignal = monitorAbortController.signal;
-
-    let getUpdatesBuf = "";
-
-
-    async function poll() {
-      if (abortSignal.aborted) return;
-
-      try {
-        const resp = await getUpdates({
-          baseUrl: currentAccount!.baseUrl ?? DEFAULT_BASE_URL,
-          token: currentAccount!.token,
-          get_updates_buf: getUpdatesBuf,
-          timeoutMs: 35000,
-        });
-
-        if (typeof resp.ret === "number" && resp.ret !== 0) {
-          if (resp.errcode === -14) {
-            // Session 过期
-            isConnected = false;
-            // 发送通知给用户
-            if (piInstance) {
-              piInstance.sendMessage({
-                customType: "weixinbot-status",
-                content: "⚠️ 微信 Session 已过期，请使用 /weixin-login 重新登录",
-                display: true,
-              }, { deliverAs: "steer", triggerTurn: false });
-            }
-            return;
-          }
-        }
-
-        // 更新 sync buf
-        if (resp.get_updates_buf) {
-          getUpdatesBuf = resp.get_updates_buf;
-        }
-
-        // 处理消息
-        if (resp.msgs && resp.msgs.length > 0) {
-          for (const msg of resp.msgs) {
-            // 忽略自己发送的消息（message_type === 2 是 BOT）
-            if (msg.message_type === 2) continue;
-
-            const fromUserId = msg.from_user_id ?? "";
-            if (!fromUserId) continue;
-
-            const textBody = extractTextBody(msg.item_list);
-            if (!textBody && (!msg.item_list || msg.item_list.length === 0)) continue;
-
-            // 构建消息文本
-            let messageText = textBody;
-
-            // 下载媒体附件, 把路径写入消息
-            for (const item of msg.item_list || []) {
-              if (item.type === 2 || item.type === 3 || item.type === 4 || item.type === 5) {
-                try {
-                  const savedPath = await downloadInboundMedia(item);
-                  if (savedPath) {
-                    const labels: Record<number, string> = { 2: "图片", 3: "语音", 4: "文件", 5: "视频" };
-                    messageText = messageText ? `${messageText}\n[${labels[item.type]}：${savedPath}]` : `[${labels[item.type]}：${savedPath}]`;
-                    continue;
-                  }
-                } catch {}
-                // 下载失败, 保留占位符
-                const fallback: Record<number, string> = { 2: "\n[收到图片消息]", 3: "\n[收到语音消息]", 4: "\n[收到文件消息]", 5: "\n[收到视频消息]" };
-                messageText += fallback[item.type] || "";
-              }
-            }
-
-            // 发送消息到 AI
-            const reqId = generateClientId();
-            pendingMessages.push({
-              reqId,
-              type: "text",
-              text: messageText,
-              accountId: currentAccount!.accountId,
-              userId: fromUserId,
-              contextToken: msg.context_token,
-            });
-
-          }
-
-          // 处理消息队列
-          processMessageQueue();
-        }
-      } catch (err) {
-
-      }
-
-      // 继续轮询
-      if (!abortSignal.aborted) {
-        setTimeout(poll, 100);
-      }
-    }
-
-    poll();
-  }
-
-  function stopMonitor() {
-    if (monitorAbortController) {
-      monitorAbortController.abort();
-      monitorAbortController = null;
-    }
-  }
-
-  // ============================================================================
-  // 发送消息
-  // ============================================================================
-
-  async function sendTextMessage(to: string, text: string, contextToken?: string): Promise<void> {
-    if (!currentAccount?.token) {
-      throw new Error("未登录微信，请先登录");
-    }
-
-    const filteredText = filterMarkdown(text);
-
-    await sendWeixinMessage({
-      baseUrl: currentAccount.baseUrl ?? DEFAULT_BASE_URL,
-      token: currentAccount.token,
-      to,
-      text: filteredText,
-      clientId: generateClientId(),
-      contextToken,
-    });
-  }
-
-  /**
-   * 发送文件/图片/视频
-   */
-  async function sendFileMessage(filePath: string, to: string, contextToken?: string): Promise<string> {
-    if (!currentAccount?.token) throw new Error("未登录微信，请先登录");
-    if (!existsSync(filePath)) throw new Error(`文件不存在: ${filePath}`);
-
-    const buf = readFileSync(filePath);
-    const rawsize = buf.length;
-    const rawfilemd5 = crypto.createHash("md5").update(buf).digest("hex");
-    const aesKey = crypto.randomBytes(16);
-    const aesKeyHex = aesKey.toString("hex");
-    const name = basename(filePath);
-    const ext = extname(filePath).toLowerCase();
-
-    // item_list 类型: 2=图片, 4=文件, 5=视频
-    const imageExts = [".jpg", ".jpeg", ".png", ".gif", ".webp", ".bmp", ".svg"];
-    const videoExts = [".mp4", ".mov", ".avi", ".mkv", ".webm", ".flv", ".wmv"];
-    const itemType = imageExts.includes(ext) ? 2 : videoExts.includes(ext) ? 5 : 4;
-
-    // getUploadUrl media_type: 1=IMAGE, 2=VIDEO, 3=FILE
-    const uploadMediaType = itemType === 2 ? 1 : itemType === 5 ? 2 : 3;
-
-    // AES-128-ECB 加密 + PKCS7 填充
-    const padLen = 16 - (buf.length % 16);
-    const padded = Buffer.concat([buf, Buffer.alloc(padLen, padLen)]);
-    const cipher = crypto.createCipheriv("aes-128-ecb", aesKey, null);
-    cipher.setAutoPadding(false);
-    const encrypted = Buffer.concat([cipher.update(padded), cipher.final()]);
-    const filesize = encrypted.length; // 密文大小
-    const filekey = crypto.randomBytes(16).toString("hex");
-
-    // 1) 获取上传 URL
-    const uploadResp = await getUploadUrl({
-      baseUrl: currentAccount.baseUrl ?? DEFAULT_BASE_URL,
-      token: currentAccount.token,
-      filekey,
-      media_type: uploadMediaType,
-      to_user_id: to,
-      rawsize,
-      rawfilemd5,
-      filesize,
-      no_need_thumb: true,
-      aeskey: aesKeyHex,
-    });
-
-    if ((uploadResp as any).ret !== undefined && (uploadResp as any).ret !== 0) {
-      throw new Error(`获取上传地址失败: ${JSON.stringify(uploadResp)}`);
-    }
-
-    // 2) 构造 CDN URL: 优先 upload_full_url, 否则用 upload_param 拼接
-    const cdnUrl = uploadResp.upload_full_url
-      || (uploadResp.upload_param
-        ? `https://novac2c.cdn.weixin.qq.com/c2c/upload?encrypted_query_param=${encodeURIComponent(uploadResp.upload_param)}&filekey=${encodeURIComponent(filekey)}`
-        : "");
-    if (!cdnUrl) {
-      throw new Error(
-        `获取上传地址失败: ${JSON.stringify(uploadResp)}`
-      );
-    }
-
-    // 3) 上传到 CDN
-    const cdnResp = await fetch(cdnUrl, {
-      method: "POST",
-      headers: { "Content-Type": "application/octet-stream" },
-      body: encrypted,
-    });
-    if (!cdnResp.ok) {
-      const errBody = await cdnResp.text().catch(() => "");
-      throw new Error(`CDN 上传失败: ${cdnResp.status} ${errBody.slice(0, 200)}`);
-    }
-
-    const downloadParam = cdnResp.headers.get("x-encrypted-param") || "";
-
-    // 4) 发送消息, 根据 itemType 构造不同的 item
-    // aes_key 必须是 base64(hex_string), 不是原始 hex
-    const cdnAesKey = Buffer.from(aesKeyHex, "utf-8").toString("base64");
-    const media = { encrypt_query_param: downloadParam, aes_key: cdnAesKey, encrypt_type: 1 };
-    let item: any;
-    if (itemType === 2) {
-      item = { type: 2, image_item: { file_name: name, file_size: rawsize, file_type: ext.replace(".", ""), file_md5: rawfilemd5, media } };
-    } else if (itemType === 5) {
-      item = { type: 5, video_item: { file_name: name, file_size: rawsize, file_type: ext.replace(".", ""), file_md5: rawfilemd5, media } };
-    } else {
-      item = { type: 4, file_item: { file_name: name, file_size: rawsize, file_type: ext.replace(".", ""), file_md5: rawfilemd5, media } };
-    }
-
-    await sendRawMessage({
-      baseUrl: currentAccount.baseUrl ?? DEFAULT_BASE_URL,
-      token: currentAccount.token,
-      to,
-      clientId: generateClientId(),
-      contextToken,
-      itemList: [item],
-    });
-
-    return `已发送 ${name} (${(rawsize / 1024).toFixed(1)} KB)`;
-  }
-
-  // ── 下载辅助 ──
-
-  function parseAesKey(aesKeyBase64: string) {
-    const decoded = Buffer.from(aesKeyBase64, "base64");
-    if (decoded.length === 16) return decoded;
-    if (decoded.length === 32) return Buffer.from(decoded.toString("ascii"), "hex");
-    return decoded;
-  }
-
-  function detectExt(data: Buffer) {
-    const h = data.toString("hex", 0, Math.min(data.length, 16)).toUpperCase();
-    if (h.startsWith("FFD8FF")) return ".jpg";
-    if (h.startsWith("89504E47")) return ".png";
-    if (h.startsWith("47494638")) return ".gif";
-    if (h.startsWith("52494646") && h.includes("57454250")) return ".webp";
-    if (h.startsWith("424D")) return ".bmp";
-    if (h.startsWith("000000") && h.includes("66747970")) return ".mp4";
-    if (h.startsWith("000000") && h.includes("6D6F6F76")) return ".mov";
-    return "";
-  }
-
-  async function downloadInboundMedia(item: any): Promise<string | null> {
-    const MAP: Record<number, string> = { 2: "image_item", 3: "voice_item", 4: "file_item", 5: "video_item" };
-    const key = MAP[item.type];
-    if (!key) return null;
-    const sub = item[key];
-    if (!sub?.media?.encrypt_query_param) return null;
-
-    const qp = sub.media.encrypt_query_param;
-    const cdnUrl = `https://novac2c.cdn.weixin.qq.com/c2c/download?encrypted_query_param=${encodeURIComponent(qp)}`;
-    const resp = await fetch(cdnUrl);
-    if (!resp.ok) return null;
-    const encrypted = Buffer.from(await resp.arrayBuffer());
-
-    let aesKey: Buffer | null = null;
-    if (sub.aeskey) {
-      aesKey = Buffer.from(sub.aeskey, "hex");
-    } else if (sub.media?.aes_key) {
-      aesKey = parseAesKey(sub.media.aes_key);
-    }
-    if (!aesKey) return null;
-
-    const decipher = crypto.createDecipheriv("aes-128-ecb", aesKey, null);
-    decipher.setAutoPadding(false);
-    let decrypted = Buffer.concat([decipher.update(encrypted), decipher.final()]);
-    const padLen = decrypted[decrypted.length - 1];
-    if (padLen > 0 && padLen <= 16) decrypted = decrypted.slice(0, decrypted.length - padLen);
-
-    let ext = "";
-    if (item.type === 3) {
-      ext = ".silk";
-    } else if (item.type === 2 || item.type === 5) {
-      ext = detectExt(decrypted);
-    }
-    const fileName = sub.file_name || "";
-    const base = fileName || `${Date.now()}`;
-    const saveName = base.includes(".") ? base : (ext ? base + ext : base);
-
-    const dir = join(tmpdir(), "weixin-inbound");
-    mkdirSync(dir, { recursive: true });
-    const savePath = join(dir, saveName);
-    fsWriteFileSync(savePath, decrypted);
-    return savePath;
-  }
-
-  // ── 连接/断开 (被 login/logout/connect/disconnect 复用)
-  // ============================================================================
-
-  async function performConnect(ctx?: any): Promise<boolean> {
-    // 当前没有加载账户, 尝试从缓存恢复
-    if (!currentAccount?.token) {
-      const cfg = await loadConfig();
-      if (cfg.lastAccountId) {
-        const saved = getLoggedInAccounts().find(a => a.accountId === cfg.lastAccountId);
-        if (saved?.token) {
-          currentAccount = saved;
-        }
-      }
-    }
-    if (!currentAccount?.token) {
-      if (ctx?.hasUI) await ctx.ui.notify("未登录, 请先 /weixin-login 扫码", "error");
-      return false;
-    }
-    if (isConnected) return true;
-
-    const lockResult = await acquireLock(SESSION_ID, currentAccount.accountId);
-    if (!lockResult.success) {
-      if (ctx?.hasUI) await ctx.ui.notify(`[weixinbot] ${lockResult.message}`, "error");
-      await updateStatus(ctx);
-      return false;
-    }
-    isConnected = true;
-    startMonitor(pi);
-    toolsEnabled = true;
-    if (ctx?.hasUI) await ctx.ui.notify("微信已连接", "info");
-    await updateStatus(ctx);
-    return true;
-  }
-
-  async function performDisconnect() {
-    if (!isConnected) return;
-    stopMonitor();
-    await releaseLock(SESSION_ID);
-    isConnected = false;
-    toolsEnabled = false;
-  }
-
-  // ============================================================================
-  // 登录/登出
-  // ============================================================================
-
-  async function performLogin(ctx?: any): Promise<boolean> {
-    try {
-      // 先尝试从缓存恢复
-      const config = await loadConfig();
-      if (config.lastAccountId) {
-        const saved = getLoggedInAccounts().find(a => a.accountId === config.lastAccountId);
-        if (saved?.token) {
-          currentAccount = saved;
-          return await performConnect(ctx);
-        }
-      }
-
-      // 没有保存的账户，走二维码登录流程
-      loginInProgress = true;
-      await updateStatus(ctx);
-
-      const result = await fullQRLogin({
-        onStatus: (status, message) => {},
-        onQRCode: (url) => {
-          if (url) {
-            try {
-              qrcodeTerminal.generate(url, { small: true }, (qrText) => {
-                if (lastCtx?.hasUI) {
-                  lastCtx.ui.notify("请用微信扫描:\n\n" + qrText, "info");
-                }
-              });
-            } catch (e) {
-              if (lastCtx?.hasUI) lastCtx.ui.notify("二维码生成失败，请重试", "error");
-            }
-          }
-        },
-      });
-
-      loginInProgress = false;
-
-      if (result.connected && result.accountId) {
-        // 加载保存的账户
-        const accounts = getLoggedInAccounts();
-        currentAccount = accounts.find(a => a.accountId === result.accountId) ?? null;
-        if (!currentAccount) {
-          await updateStatus(ctx);
-          return false;
-        }
-        await saveConfig({ lastAccountId: result.accountId });
-        return await performConnect(ctx);
-      }
-
-      await updateStatus(ctx);
-      return false;
-    } catch (err) {
-      loginInProgress = false;
-      if (ctx?.hasUI) ctx.ui.notify("微信登录异常: " + String(err), "error");
-      await updateStatus(ctx);
-      return false;
-    }
-  }
-
-  async function performLogout(accountId: string, ctx?: any): Promise<void> {
-    await performDisconnect();
-    logoutAccount(accountId);
-    if (currentAccount?.accountId === accountId) {
-      currentAccount = null;
-    }
-    await updateStatus(ctx);
-  }
-
-  // ============================================================================
-  // 注册工具（始终注册，连接后启用）
+  // 注册工具
   // ============================================================================
 
   pi.registerTool({
@@ -702,17 +42,14 @@ export default function (pi: ExtensionAPI) {
       path: Type.String({ description: "本地文件路径" }),
     }),
     async execute(_toolCallId, params, _signal, _onUpdate, _ctx) {
-      if (!toolsEnabled) {
+      if (!state.toolsEnabled) {
         return { content: [{ type: "text", text: "未连接微信, 请先 /weixin-connect" }], details: {}, isError: true };
       }
       try {
-        // 自动从待回复队列取接收者
-        const cm = pendingMessages.find(m => m.reqId === currentReqId);
-        if (!cm) {
+        if (!state.replyUserId) {
           return { content: [{ type: "text", text: "无法确定接收者，请先让微信用户发一条消息" }], details: {}, isError: true };
         }
-        const ct = pendingMessages.find(m => m.userId === cm.userId);
-        const result = await sendFileMessage(params.path, cm.userId, ct?.contextToken);
+        const result = await sendFileMessage(params.path, state.replyUserId, state.replyContextToken);
         return { content: [{ type: "text", text: result }], details: {} };
       } catch (err: any) {
         return { content: [{ type: "text", text: `发送文件失败: ${err.message}` }], details: {}, isError: true };
@@ -727,35 +64,33 @@ export default function (pi: ExtensionAPI) {
   pi.registerCommand("weixin-send", {
     description: "发送文本消息给微信用户。用法: /weixin-send <文本>",
     handler: async (args, ctx) => {
-      const text = args.trim()
-      if (!text) { await ctx.ui.notify("用法: /weixin-send <文本>", "error"); return }
+      const text = args.trim();
+      if (!text) { await ctx.ui.notify("用法: /weixin-send <文本>", "error"); return; }
       try {
-        let toUserId
-        const cm = pendingMessages.find(m => m.reqId === currentReqId)
-        if (cm) toUserId = cm.userId
-        if (!toUserId) { await ctx.ui.notify("无法确定接收者", "error"); return }
-        const ct = pendingMessages.find(m => m.userId === toUserId)
-        await sendTextMessage(toUserId, text, ct?.contextToken)
-        await ctx.ui.notify("消息已发送", "info")
-      } catch (err) { await ctx.ui.notify("发送失败: " + err.message, "error") }
+        if (!state.replyUserId) { await ctx.ui.notify("无法确定接收者", "error"); return; }
+        await sendTextMessage(state.replyUserId, text, state.replyContextToken);
+        await ctx.ui.notify("消息已发送", "info");
+      } catch (err: any) {
+        await ctx.ui.notify("发送失败: " + err.message, "error");
+      }
     },
   });
 
   pi.registerCommand("weixin-force-unlock", {
     description: "强制释放微信 session 锁",
     handler: async (_args, ctx) => {
-      const ls = await checkLockStatus()
-      if (!ls.locked) { await ctx.ui.notify("当前没有锁", "info"); return }
-      if (ls.ownedByMe) { await releaseLock(SESSION_ID); await ctx.ui.notify("已释放锁", "info"); return }
-      const ok = await forceReleaseLock()
-      await ctx.ui.notify(ok ? "已强制释放锁" : "释放锁失败", ok ? "info" : "error")
+      const ls = await checkLockStatus();
+      if (!ls.locked) { await ctx.ui.notify("当前没有锁", "info"); return; }
+      if (ls.ownedByMe) { await releaseLock(state.SESSION_ID); await ctx.ui.notify("已释放锁", "info"); return; }
+      const ok = await forceReleaseLock();
+      await ctx.ui.notify(ok ? "已强制释放锁" : "释放锁失败", ok ? "info" : "error");
     },
   });
 
   pi.registerCommand("weixin-connect", {
     description: "连接微信消息轮询（需已登录）",
     handler: async (_args, ctx) => {
-      if (isConnected) { await ctx.ui.notify("已连接", "info"); return }
+      if (state.isConnected) { await ctx.ui.notify("已连接", "info"); return; }
       await performConnect(ctx);
     },
   });
@@ -763,7 +98,7 @@ export default function (pi: ExtensionAPI) {
   pi.registerCommand("weixin-disconnect", {
     description: "断开微信消息轮询（不登出）",
     handler: async (_args, ctx) => {
-      if (!isConnected) { await ctx.ui.notify("未连接", "info"); return }
+      if (!state.isConnected) { await ctx.ui.notify("未连接", "info"); return; }
       await performDisconnect();
       await updateStatus(ctx);
       await ctx.ui.notify("已断开", "info");
@@ -773,18 +108,13 @@ export default function (pi: ExtensionAPI) {
   pi.registerCommand("weixin-logout", {
     description: "退出当前微信登录",
     handler: async (_args, ctx) => {
-      const accountId = currentAccount?.accountId;
-      if (!accountId) { await ctx.ui.notify("没有登录的账户", "info"); return }
+      const accountId = state.currentAccount?.accountId;
+      if (!accountId) { await ctx.ui.notify("没有登录的账户", "info"); return; }
       await performLogout(accountId, ctx);
       await ctx.ui.notify("已退出登录", "info");
     },
   });
 
-  // ============================================================================
-  // 注册命令
-  // ============================================================================
-
-  // 微信登录命令
   pi.registerCommand("weixin-login", {
     description: "微信扫码登录",
     handler: async (_args, ctx) => {
@@ -798,7 +128,6 @@ export default function (pi: ExtensionAPI) {
     },
   });
 
-  // 微信状态命令
   pi.registerCommand("weixin-status", {
     description: "查看微信连接状态",
     handler: async (_args, ctx) => {
@@ -806,88 +135,68 @@ export default function (pi: ExtensionAPI) {
       const lockStatus = await checkLockStatus();
       let status = `已登录账户: ${accounts.length}\n`;
       for (const acc of accounts) {
-        const isCurrent = currentAccount?.accountId === acc.accountId;
+        const isCurrent = state.currentAccount?.accountId === acc.accountId;
         status += `- ${acc.accountId?.slice(0, 12)}... ${isCurrent ? "(当前)" : ""}\n`;
       }
-      status += `当前连接: ${isConnected ? "已连接" : "未连接"}\n`;
-
-      // 添加锁状态
+      status += `当前连接: ${state.isConnected ? "已连接" : "未连接"}\n`;
       if (lockStatus.locked) {
-        if (lockStatus.ownedByMe) {
-          status += `独占锁: 🔒 当前 session 持有`;
-        } else {
-          status += `独占锁: ❌ 被其他 session 占用`;
-        }
+        status += lockStatus.ownedByMe
+          ? `独占锁: 🔒 当前 session 持有`
+          : `独占锁: ❌ 被其他 session 占用`;
       } else {
         status += `独占锁: 🔓 未锁定`;
       }
-
       await ctx.ui.notify(status, "info");
       await updateStatus(ctx);
     },
   });
 
   // ============================================================================
-  // 流处理 - 每次 turn 结束发一条微信消息
+  // turn_end: 取回复文本发给微信用户
   // ============================================================================
 
-  pi.on("turn_end", async (event, ctx) => {
-    if (!isConnected || !currentAccount) return;
-    if (pendingMessages.length === 0) return;
+  pi.on("turn_end", async (event, _ctx) => {
+    if (!state.isConnected || !state.currentAccount) return;
+    if (!state.replyUserId) return;
 
     const msg = event.message;
     if (msg.role !== "assistant") return;
+
+    const reason = msg.stopReason;
+    if (reason === "toolUse") return; // 等最终回复
+
     let replyText = "";
     for (const c of msg.content) {
       if (c.type === "text") replyText += c.text;
     }
 
     // 报错兜底
-    const reason = msg.stopReason;
     if ((reason === "error" || reason === "aborted") && !replyText.trim()) {
       replyText = `[错误] ${msg.errorMessage || reason}`;
     }
 
-    // 有文本就发送（包括报错信息）
-    const pending = pendingMessages[0];
-    const replyTo = replyToMap.get(pending.reqId);
-    if (replyText.trim() && replyTo) {
+    if (replyText.trim()) {
       try {
-        await sendTextMessage(replyTo.userId, replyText.trim(), replyTo.contextToken);
+        await sendTextMessage(state.replyUserId, replyText.trim(), state.replyContextToken);
       } catch (err: any) {
-        if (lastCtx?.hasUI) lastCtx.ui.notify("微信发送失败: " + err.message, "error");
+        if (state.lastCtx?.hasUI) state.lastCtx.ui.notify("微信发送失败: " + err.message, "error");
       }
-    }
-
-    // toolUse → 等下一轮; stop/length/error/aborted → 清理
-    if (reason !== "toolUse") {
-      pendingMessages.shift();
-      replyToMap.delete(pending.reqId);
-      await updateStatus(ctx);
-      processMessageQueue();
     }
   });
 
   // ============================================================================
-  // 事件处理
+  // 会话生命周期
   // ============================================================================
 
-  // 会话启动时仅初始化状态（不自动连接微信）
   pi.on("session_start", async (_event, ctx) => {
-    lastCtx = ctx;
+    state.lastCtx = ctx;
     await updateStatus(ctx);
   });
 
-  // 会话关闭时停止监控并释放锁
   pi.on("session_shutdown", async (_event, _ctx) => {
     stopMonitor();
-    await releaseLock(SESSION_ID);
+    await releaseLock(state.SESSION_ID);
   });
-
-  // ============================================================================
-  // 启动提示
-  // ============================================================================
-
 }
 
 // 导出工具函数供外部使用
