@@ -8,9 +8,10 @@
  */
 
 import { mkdir, readFile, writeFile } from "node:fs/promises";
-import { readFileSync, statSync, existsSync } from "node:fs";
+import { readFileSync, statSync, existsSync, mkdirSync, writeFileSync as fsWriteFileSync } from "node:fs";
 import { dirname, join, basename, extname } from "node:path";
 import { homedir } from "node:os";
+import { tmpdir } from "node:os";
 import crypto from "node:crypto";
 import qrcodeTerminal from "qrcode-terminal";
 
@@ -339,16 +340,22 @@ export default function (pi: ExtensionAPI) {
             // 构建消息文本
             let messageText = textBody;
 
-            // 检查是否有媒体附件
-            const hasImage = msg.item_list?.some(i => i.type === 2);
-            const hasVideo = msg.item_list?.some(i => i.type === 5);
-            const hasFile = msg.item_list?.some(i => i.type === 4);
-            const hasVoice = msg.item_list?.some(i => i.type === 3 && !i.voice_item?.text);
-
-            if (hasImage) messageText += "\n[收到图片消息]";
-            if (hasVideo) messageText += "\n[收到视频消息]";
-            if (hasFile) messageText += "\n[收到文件消息]";
-            if (hasVoice && !textBody) messageText = "[收到语音消息，需微信端查看]";
+            // 下载媒体附件, 把路径写入消息
+            for (const item of msg.item_list || []) {
+              if (item.type === 2 || item.type === 3 || item.type === 4 || item.type === 5) {
+                try {
+                  const savedPath = await downloadInboundMedia(item);
+                  if (savedPath) {
+                    const labels: Record<number, string> = { 2: "图片", 3: "语音", 4: "文件", 5: "视频" };
+                    messageText = messageText ? `${messageText}\n[${labels[item.type]}：${savedPath}]` : `[${labels[item.type]}：${savedPath}]`;
+                    continue;
+                  }
+                } catch {}
+                // 下载失败, 保留占位符
+                const fallback: Record<number, string> = { 2: "\n[收到图片消息]", 3: "\n[收到语音消息]", 4: "\n[收到文件消息]", 5: "\n[收到视频消息]" };
+                messageText += fallback[item.type] || "";
+              }
+            }
 
             // 发送消息到 AI
             const reqId = generateClientId();
@@ -506,8 +513,72 @@ export default function (pi: ExtensionAPI) {
     return `已发送 ${name} (${(rawsize / 1024).toFixed(1)} KB)`;
   }
 
-  // ============================================================================
-  // 连接/断开 (被 login/logout/connect/disconnect 复用)
+  // ── 下载辅助 ──
+
+  function parseAesKey(aesKeyBase64: string) {
+    const decoded = Buffer.from(aesKeyBase64, "base64");
+    if (decoded.length === 16) return decoded;
+    if (decoded.length === 32) return Buffer.from(decoded.toString("ascii"), "hex");
+    return decoded;
+  }
+
+  function detectExt(data: Buffer) {
+    const h = data.toString("hex", 0, Math.min(data.length, 16)).toUpperCase();
+    if (h.startsWith("FFD8FF")) return ".jpg";
+    if (h.startsWith("89504E47")) return ".png";
+    if (h.startsWith("47494638")) return ".gif";
+    if (h.startsWith("52494646") && h.includes("57454250")) return ".webp";
+    if (h.startsWith("424D")) return ".bmp";
+    if (h.startsWith("000000") && h.includes("66747970")) return ".mp4";
+    if (h.startsWith("000000") && h.includes("6D6F6F76")) return ".mov";
+    return "";
+  }
+
+  async function downloadInboundMedia(item: any): Promise<string | null> {
+    const MAP: Record<number, string> = { 2: "image_item", 3: "voice_item", 4: "file_item", 5: "video_item" };
+    const key = MAP[item.type];
+    if (!key) return null;
+    const sub = item[key];
+    if (!sub?.media?.encrypt_query_param) return null;
+
+    const qp = sub.media.encrypt_query_param;
+    const cdnUrl = `https://novac2c.cdn.weixin.qq.com/c2c/download?encrypted_query_param=${encodeURIComponent(qp)}`;
+    const resp = await fetch(cdnUrl);
+    if (!resp.ok) return null;
+    const encrypted = Buffer.from(await resp.arrayBuffer());
+
+    let aesKey: Buffer | null = null;
+    if (sub.aeskey) {
+      aesKey = Buffer.from(sub.aeskey, "hex");
+    } else if (sub.media?.aes_key) {
+      aesKey = parseAesKey(sub.media.aes_key);
+    }
+    if (!aesKey) return null;
+
+    const decipher = crypto.createDecipheriv("aes-128-ecb", aesKey, null);
+    decipher.setAutoPadding(false);
+    let decrypted = Buffer.concat([decipher.update(encrypted), decipher.final()]);
+    const padLen = decrypted[decrypted.length - 1];
+    if (padLen > 0 && padLen <= 16) decrypted = decrypted.slice(0, decrypted.length - padLen);
+
+    let ext = "";
+    if (item.type === 3) {
+      ext = ".silk";
+    } else if (item.type === 2 || item.type === 5) {
+      ext = detectExt(decrypted);
+    }
+    const fileName = sub.file_name || "";
+    const base = fileName || `${Date.now()}`;
+    const saveName = base.includes(".") ? base : (ext ? base + ext : base);
+
+    const dir = join(tmpdir(), "weixin-inbound");
+    mkdirSync(dir, { recursive: true });
+    const savePath = join(dir, saveName);
+    fsWriteFileSync(savePath, decrypted);
+    return savePath;
+  }
+
+  // ── 连接/断开 (被 login/logout/connect/disconnect 复用)
   // ============================================================================
 
   async function performConnect(ctx?: any): Promise<boolean> {
