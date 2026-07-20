@@ -13,7 +13,7 @@ import {
   getUploadUrl,
   DEFAULT_BASE_URL,
 } from "./weixin-api.ts";
-import { generateClientId, filterMarkdown } from "./utils.ts";
+import { generateClientId } from "./utils.ts";
 import type { WeixinState } from "./state.ts";
 
 const CDN_BASE = "https://novac2c.cdn.weixin.qq.com/c2c";
@@ -26,12 +26,11 @@ export function createMessaging(state: WeixinState) {
     if (!state.currentAccount?.token) {
       throw new Error("未登录微信，请先登录");
     }
-    const filteredText = filterMarkdown(text);
     await sendWeixinMessage({
       baseUrl: state.currentAccount.baseUrl ?? DEFAULT_BASE_URL,
       token: state.currentAccount.token,
       to,
-      text: filteredText,
+      text,
       clientId: generateClientId(),
       contextToken,
     });
