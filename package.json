@@ -30,7 +30,8 @@
   "pi": {
     "extensions": [
       "./src/weixin.ts"
-    ]
+    ],
+    "video": "https://raw.githubusercontent.com/fyc09/pi-weixin-bridge/master/assets/demo.mp4"
   },
   "engines": {
     "node": ">=18"
