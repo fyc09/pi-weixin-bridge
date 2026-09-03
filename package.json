@@ -1,17 +1,29 @@
 {
-  "name": "pi-weixin-bridge",
-  "version": "1.0.0",
+  "name": "@fyc09/pi-weixin-bridge",
+  "version": "1.0.1",
   "type": "module",
-  "description": "微信机器人 extension for pi (patched: QR display + package name fix)",
+  "description": "微信机器人 extension for pi — 通过微信官方 iLink/ClawBot 接口，扫码登录后微信私聊消息自动转发给 pi，pi 回复自动发回微信。",
   "keywords": [
     "pi-package",
     "pi",
     "weixin",
     "微信",
     "wechat",
-    "extension"
+    "wechat-bot",
+    "wechat-bridge",
+    "clawbot",
+    "ilink",
+    "extension",
+    "ai-agent",
+    "coding-agent"
   ],
   "license": "MIT",
+  "files": [
+    "src"
+  ],
+  "publishConfig": {
+    "access": "public"
+  },
   "scripts": {
     "test": "echo \"No tests\""
   },
@@ -20,12 +32,23 @@
       "./src/weixin.ts"
     ]
   },
+  "engines": {
+    "node": ">=18"
+  },
   "peerDependencies": {
     "@earendil-works/pi-coding-agent": "*"
   },
   "dependencies": {
+    "@earendil-works/pi-ai": "*",
     "qrcode-terminal": "^0.12.0"
   },
-  "repository": "github.com/fyc09/pi-weixin-bridge",
-  "credit": "Forked from huang-x-h/pi-weixinbot (MIT) — original iLink protocol implementation"
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/fyc09/pi-weixin-bridge.git"
+  },
+  "bug": {
+    "url": "https://github.com/fyc09/pi-weixin-bridge/issues"
+  },
+  "homepage": "https://github.com/fyc09/pi-weixin-bridge#readme",
+  "credit": "Inspired by huang-x-h/pi-weixinbot (MIT) — iLink protocol/login flow reference. This repo substantially rewrote the codebase; messaging, media, locking, monitor modules are original. Uses Tencent official ClawBot/iLink API."
 }

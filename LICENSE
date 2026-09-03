@@ -19,3 +19,18 @@ AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER
 LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
 OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
 SOFTWARE.
+
+---
+
+Additional notices:
+
+- The iLink protocol and QR login flow reference the project
+  huang-x-h/pi-weixinbot (https://github.com/huang-x-h/pi-weixinbot), which is
+  released under the MIT License. The copyright of that project belongs to its
+  original author (huang-x-h). Any portions retained from that project remain
+  under its original MIT copyright notice.
+
+- This repository is a substantially rewritten work. The module structure,
+  message handling, media send/receive, locking, monitoring, and state modules
+  are original to this repository. It uses the Tencent official ClawBot / iLink
+  API.
