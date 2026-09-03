@@ -1,6 +1,6 @@
 {
   "name": "@fyc09/pi-weixin-bridge",
-  "version": "1.0.1",
+  "version": "1.0.2",
   "type": "module",
   "description": "微信机器人 extension for pi — 通过微信官方 iLink/ClawBot 接口，扫码登录后微信私聊消息自动转发给 pi，pi 回复自动发回微信。",
   "keywords": [
